@@ -1,0 +1,179 @@
+name: Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+concurrency:
+  group: ${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
+  format:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: C++ formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install clang-format
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-format-15
+      - name: Check formatting
+        run: ./scripts/check-format.sh
+
+  clang-tidy:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: C++ static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-tidy-15 libomp-15-dev cmake ninja-build
+          python -m pip install "numpy>=1.23" "pybind11>=2.12"
+      - name: Locate pybind11
+        run: echo "pybind11_DIR=$(python -m pybind11 --cmakedir)" >> "$GITHUB_ENV"
+      - name: Configure compilation database
+        run: >-
+          cmake -S . -B build-tidy -G Ninja
+          -DRABITQ_BUILD_SAMPLES=OFF
+          -DRABITQ_BUILD_TESTS=OFF
+          -DRABITQ_BUILD_PYTHON_BINDINGS=ON
+          -DCMAKE_BUILD_TYPE=Release
+          -Dpybind11_DIR="$pybind11_DIR"
+      - name: Run clang-tidy
+        run: ./scripts/check-tidy.sh build-tidy
+
+  includes:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: Include cleaner (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install clang-tidy and build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-tidy clang libomp-dev cmake ninja-build
+      - name: Configure compilation database
+        run: >-
+          cmake -S . -B build-includes -G Ninja
+          -DCMAKE_CXX_COMPILER=clang++
+          -DRABITQ_BUILD_SAMPLES=OFF
+          -DRABITQ_BUILD_TESTS=OFF
+          -DRABITQ_BUILD_PYTHON_BINDINGS=OFF
+          -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Analyze library includes
+        id: analysis
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check-includes.sh build-includes 2>&1 | tee include-report.txt
+      - name: Store include report
+        if: ${{ !cancelled() && steps.analysis.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: include-report
+          path: include-report.txt
+          if-no-files-found: error
+
+  shellcheck:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.shell == 'true') }}
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+      - name: Check scripts
+        run: shellcheck scripts/*.sh
+
+  ubuntu:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: Ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DRABITQ_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: ASan and UBSan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake ninja-build
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitizers -G Ninja
+          -DRABITQ_BUILD_SAMPLES=OFF
+          -DRABITQ_BUILD_TESTS=ON
+          -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF
+          -DRABITQ_ENABLE_SANITIZERS=ON
+          -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build-sanitizers
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-sanitizers --output-on-failure
+
+  downstream-consumer:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.cpp == 'true') }}
+    name: Installed CMake consumer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake ninja-build
+      - name: Build and install RaBitQ-Library
+        run: |
+          cmake -S . -B build-install -G Ninja \
+            -DRABITQ_BUILD_SAMPLES=OFF \
+            -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/rabitqlib-install"
+          cmake --build build-install
+          cmake --install build-install
+      - name: Build downstream consumer
+        run: |
+          cmake -S tests/consumer -B build-consumer -G Ninja \
+            -DCMAKE_PREFIX_PATH="$PWD/rabitqlib-install"
+          cmake --build build-consumer
+      - name: Test downstream consumer
+        run: ctest --test-dir build-consumer --output-on-failure
